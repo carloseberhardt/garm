@@ -61,9 +61,21 @@ attack. The maintainer-change signal is weighted heavily: in the Atomic Arch
 campaign, the maintainer change was the leading indicator, days before any
 malicious commit landed.
 
-A hard static-scanner hit elevates the verdict to at least SUSPICIOUS even if
-the AI says OK. If the `claude` CLI isn't installed, garm degrades gracefully
-to static checks + maintainer-change detection.
+The static scanner has two tiers. Hard indicators (pipe-to-shell, known
+campaign IoCs) elevate the verdict to at least SUSPICIOUS no matter what the
+AI says. Soft indicators (`npm`, `eval`, `systemctl enable` — all common in
+legitimate recipes) elevate only when _newly introduced_: npm appearing in a
+package that never touched npm is loud; npm in a known Electron wrapper is
+quiet context. This keeps false positives from training you to approve on
+reflex, which is the exact failure mode the tool exists to fix.
+
+The AI pass assumes the recipe may try to talk its way past review: the diff
+is fenced as untrusted data, embedded "VERDICT: OK" / "approved upstream" text
+is treated as evidence of malice rather than followed, and if multiple verdict
+lines appear in the output the worst one wins — injection can make the verdict
+stricter, never more lenient. The static floor can only raise verdicts, never
+lower them. If the `claude` CLI isn't installed, garm degrades gracefully to
+static checks + maintainer-change detection.
 
 ## Usage
 
@@ -76,9 +88,11 @@ garm --paranoid    # auto-block SUSPICIOUS instead of prompting
 garm --tips        # print the full maintenance tips list
 ```
 
-On first use, verify your system is clean (check your packages against any
-published compromise lists, scan `~/.cache/yay` for IoCs), then run
-`garm --init` to set the baseline. From then on, `garm` is your update command.
+garm is trust-on-first-use: `--init` marks whatever is on your system _today_
+as the trusted baseline, and garm protects forward from there — it cannot
+bless the past. So before `--init`, verify you're actually clean (check your
+packages against published compromise lists, scan `~/.cache/yay` for IoCs).
+From then on, `garm` is your update command.
 
 After each successful update, garm prints one rotating tip from a curated
 list of Arch maintenance habits — orphan cleanup, `.pacnew` merges, cache
@@ -110,6 +124,14 @@ default) — typically a fraction of a cent. Override with
   yourself: garm keeps the repos under `~/.local/state/garm/repos/`.
 - **First installs have no baseline.** garm reviews the full PKGBUILD, but
   you're trusting a snapshot, not a diff history.
+- **It can't defend an already-compromised machine.** An attacker who is
+  already in can rewrite garm's state file, or garm itself. Local review
+  tools are first-vector defenses, not recovery tools — garm assumes a clean
+  starting point and protects forward from there.
+- **Review and build are not perfectly atomic.** garm reviews its own fetch
+  of the recipe; yay then re-fetches the repo to build. A recipe pushed in
+  that narrow window would build unreviewed — garm re-checks after the update
+  and warns loudly if any recipe moved during it.
 
 Defense in depth still applies: keep your AUR footprint small, prefer
 official repos when possible, read the diffs garm shows you, and consider
