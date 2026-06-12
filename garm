@@ -1,0 +1,372 @@
+#!/usr/bin/env python3
+"""garm — the hound at the gate.
+
+Reviews AUR recipe changes (PKGBUILD, .install files, etc.) for supply-chain
+tampering BEFORE yay builds them: static indicator checks plus an AI review
+pass via `claude -p`. Born out of the June 2026 "Atomic Arch" AUR compromise,
+where ~432 orphan-adopted packages had `npm install atomic-lockfile` injected
+into their recipes.
+
+Usage:
+  garm               review pending AUR recipe changes, then run `yay -Syu`
+  garm --check       review only; do not invoke yay
+  garm --init        baseline all installed AUR packages as trusted (no review)
+  garm -S pkg...     review new package recipes, then run `yay -S pkg...`
+  garm --tips        print the full maintenance tips list
+  garm --paranoid    auto-block SUSPICIOUS verdicts instead of prompting
+
+State:  ~/.local/state/garm/   (approved commit + maintainer per package)
+Tips:   ~/.config/garm/tips.txt (edit freely; one tip per line, # = comment)
+Model:  $GARM_MODEL (default claude-haiku-4-5-20251001)
+"""
+
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import urllib.parse
+import urllib.request
+from concurrent.futures import ThreadPoolExecutor
+from datetime import date
+from pathlib import Path
+
+STATE_DIR = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state")) / "garm"
+REPO_DIR = STATE_DIR / "repos"
+STATE_FILE = STATE_DIR / "state.json"
+TIPS_FILE = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "garm" / "tips.txt"
+MODEL = os.environ.get("GARM_MODEL", "claude-haiku-4-5-20251001")
+AUR_RPC = "https://aur.archlinux.org/rpc/v5/info?"
+DIFF_CAP = 50_000  # chars of diff fed to review
+
+RED = "\033[31;1m"
+YEL = "\033[33;1m"
+GRN = "\033[32;1m"
+DIM = "\033[2m"
+OFF = "\033[0m"
+
+# Hard indicators: any hit elevates the verdict to at least SUSPICIOUS,
+# regardless of what the AI says.
+STATIC_PATTERNS = [
+    (r"atomic-lockfile", "known-malware npm package (Atomic Arch campaign)"),
+    (r"\.onion\b", "Tor onion address"),
+    (r"temp\.sh", "temp.sh exfiltration endpoint"),
+    (r"(curl|wget)\b[^\n|]*\|\s*(ba|z|da)?sh\b", "pipe-to-shell download"),
+    (r"\bnpm\s+(install|i|exec|x)\b", "npm invocation in a package recipe"),
+    (r"base64\s+(-d|--decode)", "base64 decode"),
+    (r"\beval\b", "eval"),
+    (r"systemctl\s+(--user\s+)?enable", "enables a systemd unit"),
+    (r"\\x[0-9a-fA-F]{2}\\x[0-9a-fA-F]{2}", "embedded hex-encoded data"),
+]
+
+REVIEW_PROMPT = """\
+You are a security reviewer for Arch Linux AUR package recipes. The input on \
+stdin describes ONE package about to be built and installed: its AUR metadata, \
+whether the maintainer changed since the user last approved it, the new git \
+commits, and the recipe diff (or the full PKGBUILD if it's a first install).
+
+Context: in June 2026 attackers adopted ~432 orphaned AUR packages and added \
+`npm install atomic-lockfile ...` to PKGBUILDs/.install files; the npm package \
+ran a credential stealer + eBPF rootkit. Recipe tampering looks like: network \
+fetches or package-manager invocations (npm/pip/cargo) added to build or \
+install steps unrelated to what the software is; new or modified .install \
+scriptlets; source URLs moving away from the project's upstream; checksum \
+changes without a version change; encoded blobs; persistence (systemd units, \
+shell rc, autostart); a recipe change with no corresponding upstream release.
+
+Benign and common: pkgver/pkgrel bumps with matching checksum updates, \
+dependency changes consistent with the upstream project, packaging cleanups, \
+and constant pkgver churn in -git packages.
+
+Weigh the maintainer-change signal heavily: a recent adoption plus a recipe \
+change is exactly the attack pattern.
+
+Reply with EXACTLY this format and nothing else:
+Line 1: VERDICT: OK   or   VERDICT: SUSPICIOUS   or   VERDICT: MALICIOUS
+Then 1-5 short bullet lines explaining why.
+Default to SUSPICIOUS when uncertain; reserve MALICIOUS for concrete evidence."""
+
+DEFAULT_TIPS = [
+    "Orphaned dependencies pile up. List them: pacman -Qdtq — remove after review: sudo pacman -Rns $(pacman -Qdtq)",
+    "Merge pending config updates (.pacnew files): sudo pacdiff   (from pacman-contrib; set DIFFPROG=nvim if you like)",
+    "Trim the package cache: paccache -rk2 keeps 2 versions; enable it monthly: sudo systemctl enable --now paccache.timer",
+    "Anything failing silently? systemctl --failed && systemctl --user --failed",
+    "Journal eating disk? journalctl --disk-usage — cap it: sudo journalctl --vacuum-time=4weeks",
+    "Read Arch news before a big upgrade — manual interventions get announced there: yay -Pw",
+    "Audit what you explicitly installed and prune what you no longer use: pacman -Qe | less",
+    "Smaller AUR footprint = smaller attack surface. Review it: pacman -Qm",
+    "Verify package file integrity (catches tampering and bit rot): sudo pacman -Qkk 2>/dev/null | grep -v ' 0 altered'",
+    "Post-AUR-incident habit: skim ~/.config/systemd/user/ and /etc/systemd/system/ for units you don't recognize.",
+    "Kernel, systemd, or glibc updated? Reboot soon — you literally installed reboot-arch-btw for this.",
+    "SSD trim on? systemctl status fstrim.timer — enable: sudo systemctl enable --now fstrim.timer",
+    "Know what runs on a schedule: systemctl list-timers && systemctl --user list-timers",
+    "Stale mirrors cause weird partial updates. Refresh: rate-mirrors arch | sudo tee /etc/pacman.d/mirrorlist (and merge any mirrorlist.pacnew!)",
+    "Preview updates without touching sync DBs (avoids partial-upgrade risk): checkupdates   (pacman-contrib)",
+    "Check the pacman database for consistency now and then: pacman -Dk",
+    "After a big upgrade, skim for trouble: grep -E 'warning|error' /var/log/pacman.log | tail -20",
+    "Rotate SSH keys and API tokens occasionally, and audit ~/.ssh/authorized_keys — supply-chain malware goes straight for these.",
+]
+
+
+def sh(args, **kw):
+    return subprocess.run(args, capture_output=True, text=True, **kw)
+
+
+def load_state():
+    if STATE_FILE.exists():
+        return json.loads(STATE_FILE.read_text())
+    return {"packages": {}, "tip_index": 0}
+
+
+def save_state(state):
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    STATE_FILE.write_text(json.dumps(state, indent=2, sort_keys=True) + "\n")
+
+
+def foreign_packages():
+    out = sh(["pacman", "-Qm"]).stdout.split()
+    return out[::2]  # name version name version ...
+
+
+def sync_repo(pkg):
+    """Clone or fetch the AUR git repo for pkg. Returns remote HEAD or None."""
+    repo = REPO_DIR / pkg
+    try:
+        if (repo / ".git").exists():
+            r = sh(["git", "-C", str(repo), "fetch", "-q", "origin", "master"], timeout=60)
+            if r.returncode != 0:
+                return None
+            rev = sh(["git", "-C", str(repo), "rev-parse", "FETCH_HEAD"])
+        else:
+            REPO_DIR.mkdir(parents=True, exist_ok=True)
+            r = sh(["git", "clone", "-q", f"https://aur.archlinux.org/{pkg}.git", str(repo)], timeout=120)
+            if r.returncode != 0:
+                return None
+            rev = sh(["git", "-C", str(repo), "rev-parse", "origin/master"])
+        return rev.stdout.strip() or None
+    except subprocess.TimeoutExpired:
+        return None
+
+
+def rpc_info(pkgs):
+    if not pkgs:
+        return {}
+    qs = "&".join("arg[]=" + urllib.parse.quote(p) for p in pkgs)
+    with urllib.request.urlopen(AUR_RPC + qs, timeout=30) as resp:
+        data = json.load(resp)
+    return {r["Name"]: r for r in data.get("results", [])}
+
+
+def recipe_diff(pkg, old_commit, new_commit):
+    repo = str(REPO_DIR / pkg)
+    if old_commit:
+        log = sh(["git", "-C", repo, "log", "--format=%h %ad %an <%ae> %s",
+                  "--date=short", f"{old_commit}..{new_commit}"]).stdout
+        diff = sh(["git", "-C", repo, "diff", f"{old_commit}..{new_commit}"]).stdout
+    else:
+        log = sh(["git", "-C", repo, "log", "--format=%h %ad %an <%ae> %s",
+                  "--date=short", "-5", new_commit]).stdout
+        diff = sh(["git", "-C", repo, "show", f"{new_commit}", "--stat"]).stdout
+        for f in sorted(Path(repo).iterdir()):
+            if f.name == "PKGBUILD" or f.suffix == ".install":
+                diff += f"\n===== full contents of {f.name} =====\n{f.read_text(errors='replace')}"
+    return log, diff[:DIFF_CAP] + ("\n[... diff truncated ...]" if len(diff) > DIFF_CAP else "")
+
+
+def static_scan(text):
+    hits = []
+    for pat, why in STATIC_PATTERNS:
+        if re.search(pat, text):
+            hits.append(why)
+    return hits
+
+
+def ai_review(bundle):
+    claude = shutil.which("claude")
+    if not claude:
+        return None, ["claude CLI not found — static checks only"]
+    try:
+        r = subprocess.run([claude, "-p", REVIEW_PROMPT, "--model", MODEL],
+                           input=bundle, capture_output=True, text=True, timeout=240)
+    except subprocess.TimeoutExpired:
+        return None, ["claude review timed out"]
+    if r.returncode != 0:
+        return None, [f"claude failed: {r.stderr.strip()[:200]}"]
+    m = re.search(r"VERDICT:\s*(OK|SUSPICIOUS|MALICIOUS)", r.stdout)
+    if not m:
+        return "SUSPICIOUS", ["could not parse AI verdict; raw output:"] + r.stdout.strip().splitlines()[:6]
+    reasons = [ln.strip().lstrip("-•* ").strip() for ln in r.stdout[m.end():].strip().splitlines() if ln.strip()][:6]
+    return m.group(1), reasons
+
+
+def review_package(pkg, head, info, stored, first_install=False):
+    """Returns (verdict, reasons, static_hits)."""
+    old = stored.get("commit") if stored else None
+    log, diff = recipe_diff(pkg, old, head)
+    hits = static_scan(diff)
+
+    old_maint = (stored or {}).get("maintainer")
+    cur_maint = info.get("Maintainer") if info else None
+    maint_changed = bool(old_maint) and old_maint != cur_maint
+
+    meta = []
+    if info:
+        meta.append(f"Package: {pkg}  Version: {info.get('Version')}")
+        meta.append(f"Upstream URL: {info.get('URL')}")
+        meta.append(f"Maintainer: {cur_maint}  Votes: {info.get('NumVotes')}  "
+                    f"FirstSubmitted: {date.fromtimestamp(info.get('FirstSubmitted', 0))}  "
+                    f"LastModified: {date.fromtimestamp(info.get('LastModified', 0))}")
+    if maint_changed:
+        meta.append(f"!! MAINTAINER CHANGED since last approval: {old_maint} -> {cur_maint}")
+    if first_install:
+        meta.append("First install: no approved baseline; full recipe included below.")
+    if hits:
+        meta.append("Static scanner flagged: " + "; ".join(hits))
+
+    bundle = "\n".join(meta) + f"\n\n===== new commits =====\n{log}\n===== recipe diff =====\n{diff}\n"
+    verdict, reasons = ai_review(bundle)
+
+    if verdict is None:  # no AI available — fall back to static result
+        verdict = "SUSPICIOUS" if (hits or maint_changed) else "OK"
+        reasons = reasons + (["static hits: " + "; ".join(hits)] if hits else [])
+        if maint_changed:
+            reasons.append(f"maintainer changed: {old_maint} -> {cur_maint}")
+    elif verdict == "OK" and hits:
+        verdict = "SUSPICIOUS"
+        reasons.insert(0, "elevated by static scanner: " + "; ".join(hits))
+    return verdict, reasons, hits
+
+
+def print_tip(state):
+    TIPS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    if not TIPS_FILE.exists():
+        TIPS_FILE.write_text("# garm maintenance tips — one per line, edit freely\n"
+                             + "\n".join(DEFAULT_TIPS) + "\n")
+    tips = [t for t in TIPS_FILE.read_text().splitlines() if t.strip() and not t.startswith("#")]
+    if not tips:
+        return
+    i = state.get("tip_index", 0) % len(tips)
+    print(f"\n{DIM}🦴 garm tip [{i + 1}/{len(tips)}]:{OFF} {tips[i]}")
+    state["tip_index"] = i + 1
+
+
+def color_verdict(v):
+    return {"OK": GRN, "SUSPICIOUS": YEL, "MALICIOUS": RED}.get(v, "") + v + OFF
+
+
+def decide(pkg, verdict, reasons, paranoid):
+    print(f"\n  {pkg}: {color_verdict(verdict)}")
+    for r in reasons:
+        print(f"    {DIM}- {r}{OFF}")
+    if verdict == "OK":
+        return True
+    if verdict == "MALICIOUS":
+        print(f"  {RED}blocked.{OFF} Inspect by hand: {REPO_DIR / pkg}")
+        return False
+    if paranoid:
+        print(f"  {YEL}blocked (--paranoid).{OFF}")
+        return False
+    ans = input(f"  approve {pkg} anyway? [y/N] ").strip().lower()
+    return ans == "y"
+
+
+def main():
+    args = sys.argv[1:]
+    if "--help" in args or "-h" in args:
+        print(__doc__)
+        return 0
+    state = load_state()
+    if "--tips" in args:
+        tips_state = dict(state)
+        TIPS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        if not TIPS_FILE.exists():
+            print_tip(tips_state)  # force file creation
+        for i, t in enumerate([t for t in TIPS_FILE.read_text().splitlines()
+                               if t.strip() and not t.startswith("#")], 1):
+            print(f"{i:3}. {t}")
+        return 0
+
+    paranoid = "--paranoid" in args
+    check_only = "--check" in args
+    init = "--init" in args
+    install_mode = "-S" in args
+    new_pkgs = args[args.index("-S") + 1:] if install_mode else []
+
+    targets = new_pkgs if install_mode else foreign_packages()
+    if not targets:
+        print("no AUR packages found.")
+        return 0
+
+    print(f"{DIM}garm: fetching {len(targets)} AUR repo(s)...{OFF}")
+    with ThreadPoolExecutor(8) as ex:
+        heads = dict(zip(targets, ex.map(sync_repo, targets)))
+    info = rpc_info(targets)
+
+    pkgs_state = state["packages"]
+    to_review, blocked, errors = [], [], []
+    for pkg in targets:
+        head = heads.get(pkg)
+        if head is None:
+            errors.append(pkg)
+            continue
+        if pkg not in info and not install_mode:
+            print(f"{YEL}!! {pkg}: no longer exists on the AUR (deleted/renamed?) — "
+                  f"that's how compromised packages get pulled. Investigate.{OFF}")
+            continue
+        stored = pkgs_state.get(pkg)
+        if init:
+            pkgs_state[pkg] = {"commit": head,
+                               "maintainer": info.get(pkg, {}).get("Maintainer"),
+                               "reviewed": str(date.today()) + " (baselined, not reviewed)"}
+            continue
+        if stored and stored.get("commit") == head:
+            continue  # recipe unchanged since approval
+        to_review.append((pkg, head, stored))
+
+    if errors:
+        print(f"{YEL}could not fetch: {', '.join(errors)} (network? package gone?){OFF}")
+
+    if init:
+        save_state(state)
+        print(f"{GRN}baselined {len(targets)} package(s) at their current recipes.{OFF}")
+        return 0
+
+    if not to_review:
+        print(f"{GRN}garm: no recipe changes since last approval.{OFF}")
+    else:
+        print(f"garm: reviewing {len(to_review)} changed recipe(s) "
+              f"{DIM}(model: {MODEL}){OFF}")
+        for pkg, head, stored in to_review:
+            verdict, reasons, _ = review_package(
+                pkg, head, info.get(pkg, {}), stored,
+                first_install=stored is None)
+            if decide(pkg, verdict, reasons, paranoid):
+                pkgs_state[pkg] = {"commit": head,
+                                   "maintainer": info.get(pkg, {}).get("Maintainer"),
+                                   "reviewed": str(date.today())}
+            else:
+                blocked.append(pkg)
+        save_state(state)
+
+    if blocked:
+        print(f"\n{RED}blocked: {', '.join(blocked)}{OFF} — excluded via --ignore. "
+              f"Repos kept for inspection under {REPO_DIR}")
+    if check_only:
+        return 1 if blocked else 0
+
+    yay_cmd = (["yay", "-S"] + [p for p in new_pkgs if p not in blocked]) if install_mode \
+        else ["yay", "-Syu"] + (["--ignore", ",".join(blocked)] if blocked else [])
+    if install_mode and not [p for p in new_pkgs if p not in blocked]:
+        print("nothing left to install.")
+        return 1
+    print(f"\n{DIM}garm: handing off to: {' '.join(yay_cmd)}{OFF}")
+    rc = subprocess.call(yay_cmd)
+    if rc == 0:
+        print_tip(state)
+        save_state(state)
+    return rc
+
+
+if __name__ == "__main__":
+    sys.exit(main())
