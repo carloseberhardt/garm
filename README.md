@@ -134,8 +134,21 @@ default) — typically a fraction of a cent. Override with
   and warns loudly if any recipe moved during it.
 
 Defense in depth still applies: keep your AUR footprint small, prefer
-official repos when possible, read the diffs garm shows you, and consider
-`npm config set ignore-scripts true` if your workflow tolerates it.
+official repos when possible, and read the diffs garm shows you.
+
+## Companion hardening: npm `ignore-scripts`
+
+The Atomic Arch payload didn't run from the PKGBUILD itself — it ran from the
+malicious npm package's `preinstall` lifecycle hook. Defuse that entire
+vector with:
+
+```sh
+npm config set ignore-scripts true
+```
+
+If you don't use npm much, this is free safety. If you do node development,
+packages with `postinstall` build steps (esbuild, sharp) will need a
+per-project override: `ignore-scripts=false` in the project's `.npmrc`.
 
 ## License
 
