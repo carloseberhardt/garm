@@ -5,7 +5,7 @@
 In Norse myth, Garmr is the hound who guards the gate of Hel and howls when
 something tries to pass that shouldn't. This `garm` does the same for your
 Arch system: before `yay` builds an AUR package, garm inspects what actually
-changed in the package's *recipe* — the PKGBUILD, `.install` scriptlets, and
+changed in the package's _recipe_ — the PKGBUILD, `.install` scriptlets, and
 everything else in the AUR git repo — and flags anything that looks like
 supply-chain tampering.
 
@@ -31,7 +31,7 @@ nobody reads them. garm reads them.
 
 ## Why not a pacman hook?
 
-pacman/alpm hooks fire during the *transaction* — but by then `makepkg` has
+pacman/alpm hooks fire during the _transaction_ — but by then `makepkg` has
 already executed the PKGBUILD's `prepare()`/`build()` functions as your user,
 which is exactly when build-time payloads run. The only safe interception
 point is **before makepkg**, which means wrapping the AUR helper. garm wraps
@@ -56,7 +56,7 @@ garm
 garm keeps its own per-package baseline (`approved commit` + `maintainer`) in
 `~/.local/state/garm/state.json`. The review trigger is **"the recipe changed
 since you last approved it"**, not "there's a version update" — which means it
-also catches recipe changes with *no* version bump, the signature of this
+also catches recipe changes with _no_ version bump, the signature of this
 attack. The maintainer-change signal is weighted heavily: in the Atomic Arch
 campaign, the maintainer change was the leading indicator, days before any
 malicious commit landed.
@@ -88,7 +88,7 @@ switches. Edit the list at `~/.config/garm/tips.txt`.
 ## Install
 
 ```sh
-git clone https://github.com/YOURUSER/garm
+git clone https://github.com/carloseberhardt/garm
 ln -s "$PWD/garm/garm" ~/.local/bin/garm
 garm --init
 ```
