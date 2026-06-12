@@ -118,3 +118,11 @@ official repos when possible, read the diffs garm shows you, and consider
 ## License
 
 MIT
+
+## AI
+The script and this readme were entirely generated with AI (apart from 
+this section). After learning of the AUR package compromise I ran claude
+code and used the Fable model to check if I had any concerns on my 
+system. I then suggested we create a wrapper script that would automate
+similar checks every time I updated the system. The rest of the work was
+done by the Fable model and claude code.
