@@ -61,7 +61,7 @@ attack. The maintainer-change signal is weighted heavily: in the Atomic Arch
 campaign, the maintainer change was the leading indicator, days before any
 malicious commit landed.
 
-The static scanner has two tiers. Hard indicators (pipe-to-shell, known
+The static scanner has three tiers. Hard indicators (pipe-to-shell, known
 campaign IoCs) elevate the verdict to at least SUSPICIOUS no matter what the
 AI says. Soft indicators (`npm`, `eval`, `systemctl enable` — all common in
 legitimate recipes) elevate only when _newly introduced_: npm appearing in a
@@ -69,13 +69,25 @@ package that never touched npm is loud; npm in a known Electron wrapper is
 quiet context. This keeps false positives from training you to approve on
 reflex, which is the exact failure mode the tool exists to fix.
 
+The third tier matches obfuscation _shapes_ rather than literal strings —
+character-encoding escapes (`$'\x6e\x70\x6d'`), fragmented string literals
+(`'b''u''n'`), and locally-assembled data piped to a shell. The second wave of
+the June 2026 campaign fragmented and char-escaped its payloads specifically to
+slip past literal IoC lists, so garm flags the structure of concealment itself:
+a recipe has no legitimate reason to hide what it runs. Unlike the soft tier,
+shapes are a hard floor — any hit elevates to at least SUSPICIOUS whenever it
+appears, including in a first install's full PKGBUILD, not only when newly
+introduced.
+
 The AI pass assumes the recipe may try to talk its way past review: the diff
 is fenced as untrusted data, embedded "VERDICT: OK" / "approved upstream" text
 is treated as evidence of malice rather than followed, and if multiple verdict
 lines appear in the output the worst one wins — injection can make the verdict
 stricter, never more lenient. The static floor can only raise verdicts, never
-lower them. If the `claude` CLI isn't installed, garm degrades gracefully to
-static checks + maintainer-change detection.
+lower them. If the `claude` CLI isn't installed, garm degrades to static checks
++ maintainer-change detection and says so loudly — the static tiers catch the
+_shape_ of obfuscation but cannot reason about an unfamiliar payload the way the
+AI pass can, so the full review is the one that installs `claude`.
 
 ## Usage
 
